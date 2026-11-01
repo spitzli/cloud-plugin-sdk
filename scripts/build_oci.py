@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Push an OCI image through the operator-qualified rootless BuildKit service."""
+from __future__ import annotations
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+MAX_FAILURE_LOG_BYTES = 2 * 1024 * 1024
+
+
+class BuildFailed(ValueError):
+    def __init__(self, private_log):
+        super().__init__('Qualified rootless OCI build failed')
+        self.private_log = private_log
+
+
+def retain_failure_log(log, temporary_root, secrets):
+    # Read enough overlap to redact credentials before truncating the retained tail.
+    with Path(log).open('rb') as source:
+        size = source.seek(0, os.SEEK_END)
+        offset = max(0, size - MAX_FAILURE_LOG_BYTES - 8192)
+        source.seek(offset)
+        raw = source.read(MAX_FAILURE_LOG_BYTES + 8192)
+    if offset:
+        raw = raw.split(b'\n', 1)[1] if b'\n' in raw else b''
+    for secret in sorted({value.encode() for value in secrets if value}, key=len, reverse=True):
+        raw = raw.replace(secret, b'[REDACTED]')
+    descriptor, filename = tempfile.mkstemp(prefix='plugin-build-failure-', suffix='.log', dir=temporary_root)
+    with os.fdopen(descriptor, 'wb') as output:
+        output.write(raw[-MAX_FAILURE_LOG_BYTES:])
+    return Path(filename)
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def metadata_digest(metadata):
+    value = metadata.get('containerimage.digest')
+    require(isinstance(value, str) and re.fullmatch(r'sha256:[a-f0-9]{64}', value)
+            and not re.search(r'([a-f0-9])\1{63}$', value), 'Actual OCI image digest required')
+    return value
+
+
+def validate_socket(address, uid=None, runtime_root=None):
+    uid = os.getuid() if uid is None else uid
+    runtime_root = Path('/run/user') / str(uid) if runtime_root is None else Path(runtime_root)
+    require(uid != 0 and isinstance(address, str) and address.startswith('unix:///'), 'Non-root Unix BuildKit service required')
+    path = Path(address.removeprefix('unix://'))
+    require(path.is_absolute() and path.resolve() == path and path.is_relative_to(runtime_root), 'BuildKit socket must be canonical under the runner runtime directory')
+    info = path.stat()
+    require(not path.is_symlink() and stat.S_ISSOCK(info.st_mode) and info.st_uid == uid, 'BuildKit socket must belong to the runner UID')
+    return str(path)
+
+
+def qualified_buildctl(config):
+    executable = shutil.which('buildctl')
+    require(executable, 'Preinstalled qualified buildctl required')
+    path = Path(executable).resolve()
+    info = path.stat()
+    expected = config.get('WEBDOCK_BUILDCTL_SHA256', '')
+    require(re.fullmatch(r'[a-f0-9]{64}', expected) and stat.S_ISREG(info.st_mode)
+            and info.st_uid in {0, os.getuid()} and info.st_mode & 0o022 == 0,
+            'Pinned operator-qualified buildctl binary required')
+    require(hashlib.sha256(path.read_bytes()).hexdigest() == expected, 'buildctl binary checksum mismatch')
+    version = subprocess.run([str(path), '--version'], check=True, capture_output=True, text=True, timeout=10)
+    require(re.search(r'\bv0\.34\.1(?:\s|$)', version.stdout), 'Qualified BuildKit v0.34.1 required')
+    return str(path)
+
+
+def build_image(context, temporary_root, config, token, check=False):
+    context = Path(context).resolve()
+    temporary_root = Path(temporary_root).resolve()
+    require(not temporary_root.is_relative_to(context), 'Private runner temporary files must remain outside the build context')
+    require((context / 'Dockerfile').is_file() and not (context / 'Dockerfile').is_symlink(), 'Real root Dockerfile required')
+    repository, revision, actor = (config.get(name, '') for name in ['IMAGE_REPOSITORY', 'GITHUB_SHA', 'GITHUB_ACTOR'])
+    require(re.fullmatch(r'ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+', repository), 'Exact GHCR image repository required')
+    require(re.fullmatch(r'[a-f0-9]{40}', revision), 'Exact source revision required')
+    require(re.fullmatch(r'[A-Za-z0-9_-]+(?:\[bot\])?', actor), 'GitHub actor required')
+    require(isinstance(token, str) and (check and token == '' or re.fullmatch(r'[A-Za-z0-9_.-]{10,2048}', token)), 'GitHub job token must arrive through stdin')
+    address = config.get('WEBDOCK_BUILDKIT_ADDR', '')
+    validate_socket(address)
+    buildctl = qualified_buildctl(config)
+    with tempfile.TemporaryDirectory(prefix='plugin-build-', dir=temporary_root) as temporary:
+        private = Path(temporary)
+        os.chmod(private, 0o700)
+        docker_config = private / 'auth'
+        docker_config.mkdir(mode=0o700)
+        auth = base64.b64encode((actor + ':' + token).encode()).decode() if token else None
+        with open(docker_config / 'config.json', 'x', opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
+            json.dump({'auths': {'ghcr.io': {'auth': auth}} if auth else {}}, output)
+        metadata = private / 'metadata.json'
+        environment = {name: config[name] for name in ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'XDG_RUNTIME_DIR'] if name in config}
+        environment['DOCKER_CONFIG'] = str(docker_config)
+        arguments = [buildctl, '--addr', address, 'build', '--progress=plain', '--frontend=dockerfile.v0',
+                     '--local', 'context=' + str(context), '--local', 'dockerfile=' + str(context),
+                     '--opt', 'filename=Dockerfile', '--opt', 'platform=linux/amd64',
+                     '--opt', 'attest:provenance=mode=max',
+                     '--opt', 'label:org.opencontainers.image.source=https://github.com/' + repository.removeprefix('ghcr.io/'),
+                     '--opt', 'label:org.opencontainers.image.revision=' + revision]
+        if check:
+            arguments += ['--opt', 'target=check']
+        else:
+            arguments += ['--output', 'type=image,name=' + repository + ':' + revision + ',push=true', '--metadata-file', str(metadata)]
+        # Never print source-controlled build text as workflow commands.
+        try:
+            with open(private / 'build.log', 'xb', opener=lambda name, flags: os.open(name, flags, 0o600)) as log:
+                result = subprocess.run(arguments, env=environment, stdout=log, stderr=subprocess.STDOUT, timeout=1500)
+            require(result.returncode == 0, 'Qualified rootless OCI build/push failed')
+            if check:
+                return None
+            require(metadata.is_file() and not metadata.is_symlink() and metadata.stat().st_size <= 128 * 1024, 'Bounded BuildKit image metadata required')
+            return metadata_digest(json.loads(metadata.read_text()))
+        except Exception:
+            retained = retain_failure_log(private / 'build.log', temporary_root, [token, auth, actor + ':' + token if token else ''])
+            raise BuildFailed(retained) from None
+
+
+def main():
+    require(sys.argv[1:] in [[], ['--check']], 'Only the default production image or --check target is supported')
+    check = sys.argv[1:] == ['--check']
+    token = sys.stdin.buffer.read(2049)
+    require(len(token) <= 2048, 'GitHub job token exceeds bounds')
+    digest = build_image(Path.cwd(), Path(os.environ['RUNNER_TEMP']), os.environ, token.decode().strip(), check)
+    if check:
+        print('Qualified rootless Dockerfile check target passed')
+        return
+    image = os.environ['IMAGE_REPOSITORY'] + '@' + digest
+    if os.environ.get('GITHUB_OUTPUT'):
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+            output.write('digest=' + digest + '\nimage=' + image + '\n')
+    print('Pushed immutable image through qualified rootless BuildKit: ' + image)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print('Rootless OCI release failed; check qualified runner, socket, binary pin, registry access and source build.', file=sys.stderr)
+        if isinstance(error, BuildFailed):
+            path = str(error.private_log).replace('\r', '?').replace('\n', '?')
+            print('Private redacted build log: ' + path, file=sys.stderr)
+        raise SystemExit(1) from None

@@ -1,0 +1,25 @@
+name: SDK EU checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sdk-check-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.WEBDOCK_PLUGIN_CI_RUNNER) }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Check locked SDK in the qualified rootless EU builder
+        env:
+          IMAGE_REPOSITORY: ghcr.io/spitzli/cloud-plugin-sdk
+          WEBDOCK_BUILDKIT_ADDR: ${{ vars.WEBDOCK_BUILDKIT_ADDR }}
+          WEBDOCK_BUILDCTL_SHA256: ${{ vars.WEBDOCK_BUILDCTL_SHA256 }}
+        run: python3 scripts/build_oci.py --check < /dev/null
