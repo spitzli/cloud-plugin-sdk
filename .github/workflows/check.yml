@@ -1,4 +1,6 @@
-name: SDK EU checks
+# Execution stays disabled until the operator records Blacksmith qualification.
+# See webdock/tools/plugin-ci/BLACKSMITH.md; runner labels alone do not select a region.
+name: SDK Blacksmith checks
 on:
   push:
   pull_request:
@@ -10,25 +12,50 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.WEBDOCK_PLUGIN_CI_RUNNER) }}
+    if: vars.WEBDOCK_BLACKSMITH_READY == 'true' && vars.WEBDOCK_BLACKSMITH_REGION != '' && vars.WEBDOCK_BLACKSMITH_BUILDER_READY == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
+    env:
+      WEBDOCK_OCI_BACKEND: blacksmith-buildx
+      WEBDOCK_BLACKSMITH_REGION: ${{ vars.WEBDOCK_BLACKSMITH_REGION }}
     steps:
+      - name: Require reviewed Blacksmith execution
+        shell: bash
+        env:
+          QUALIFIED_BLACKSMITH_REGION: ${{ vars.WEBDOCK_BLACKSMITH_REGION }}
+        run: |
+          set -euo pipefail
+          case "${BLACKSMITH_REGION:-}" in us-east|us-west|eu-central|eu-west) ;; *) echo 'Recorded Blacksmith region required' >&2; exit 1 ;; esac
+          test "$BLACKSMITH_REGION" = "$QUALIFIED_BLACKSMITH_REGION"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Require the qualified persistent runner profile
+      - name: Reject unexpected existing BuildKit before provider setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e buildkitd.toml
+          python3 scripts/build_oci.py --before-blacksmith-setup
+      - name: Set up the managed Blacksmith builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # reviewed v2
+        with:
+          cache-key: Dockerfile
+          nofallback: true
+          buildx-version: v0.23.0
+          platforms: linux/amd64
+      - name: Verify provider builder and keep generated configuration outside source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_oci.py --assert-blacksmith-builder
+          mv -- buildkitd.toml "$RUNNER_TEMP/blacksmith-buildkitd.toml"
+      - name: Require the managed Blacksmith tooling
         shell: bash
         run: |
           set -euo pipefail
           test "$(id -u)" -ne 0
-          test "$CARGO_BUILD_JOBS" = 3
-          test -d "$CARGO_TARGET_DIR"
-          test -O "$CARGO_TARGET_DIR"
-          command -v buildctl
-      - name: Check locked SDK in the qualified rootless EU builder
+          command -v docker
+      - name: Check locked SDK in the qualified qualified Blacksmith builder
         env:
           IMAGE_REPOSITORY: ghcr.io/spitzli/cloud-plugin-sdk
-          WEBDOCK_BUILDKIT_ADDR: ${{ vars.WEBDOCK_BUILDKIT_ADDR }}
-          WEBDOCK_BUILDCTL_SHA256: ${{ vars.WEBDOCK_BUILDCTL_SHA256 }}
         run: python3 scripts/build_oci.py --check < /dev/null
